@@ -1080,19 +1080,22 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Determine sender
+				// Determine sender. Group history messages carry the author in
+				// WebMessageInfo.Participant (older payloads used Key.Participant).
+				// Store the bare user like handleMessage does, not the full JID.
 				var sender string
-				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
+				isFromMe := msg.Message.GetKey().GetFromMe()
+				participant := msg.Message.GetParticipant()
+				if participant == "" {
+					participant = msg.Message.GetKey().GetParticipant()
+				}
+				if isFromMe {
+					sender = client.Store.ID.User
+				} else if participant != "" {
+					if participantJID, parseErr := types.ParseJID(participant); parseErr == nil {
+						sender = participantJID.User
 					} else {
-						sender = jid.User
+						sender = participant
 					}
 				} else {
 					sender = jid.User
