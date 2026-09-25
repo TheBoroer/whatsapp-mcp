@@ -342,15 +342,17 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
+        # Build base query; the messages table is only joined when the last message is wanted
+        last_message_columns = (
+            "messages.content, messages.sender, messages.is_from_me" if include_last_message
+            else "NULL, NULL, NULL"
+        )
+        query_parts = [f"""
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_message_columns}
             FROM chats
         """]
         
@@ -691,17 +693,17 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        query = """
-            SELECT 
+        # The messages table is only joined when the last message is wanted
+        last_message_columns = "m.content, m.sender, m.is_from_me" if include_last_message else "NULL, NULL, NULL"
+        query = f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                {last_message_columns}
             FROM chats c
         """
-        
+
         if include_last_message:
             query += """
                 LEFT JOIN messages m ON c.jid = m.chat_jid 
