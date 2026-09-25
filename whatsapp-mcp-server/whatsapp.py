@@ -91,7 +91,7 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
-def format_message(message: Message, show_chat_info: bool = True) -> None:
+def format_message(message: Message, show_chat_info: bool = True) -> str:
     """Print a single message with consistent formatting."""
     output = ""
     
@@ -99,11 +99,11 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
+
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
@@ -111,7 +111,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         print(f"Error formatting message: {e}")
     return output
 
-def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
+def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> str:
     output = ""
     if not messages:
         output += "No messages to display."
@@ -132,7 +132,7 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Message]:
+) -> str:
     """Get messages matching the specified criteria with optional context."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
@@ -213,11 +213,11 @@ def list_messages(
             return format_messages_list(messages_with_context, show_chat_info=True)
             
         # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
-        
+        return format_messages_list(result, show_chat_info=True)
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
-        return []
+        return ""
     finally:
         if 'conn' in locals():
             conn.close()
