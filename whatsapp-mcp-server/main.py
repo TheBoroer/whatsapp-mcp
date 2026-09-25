@@ -80,8 +80,12 @@ async def _confirm_send(ctx: Context, recipient: str, what: str, body: Optional[
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
-    """Search WhatsApp contacts by name or phone number.
-    
+    """Search WhatsApp contacts by name, phone number, or LID.
+
+    Each contact has `jid` (phone JID when known) and `lid_jid`. Many chats are
+    stored under the LID, so use `lid_jid` (when set) as the chat_jid for
+    reading messages.
+
     Args:
         query: Search term to match against contact names or phone numbers
     """

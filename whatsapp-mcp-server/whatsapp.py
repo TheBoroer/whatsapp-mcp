@@ -1,13 +1,19 @@
 import sqlite3
 from datetime import datetime
+from contextlib import closing
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict
 import os.path
+import re
+import sys
 import requests
 import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# The bridge's whatsmeow store: saved contact names and the LID-to-phone map
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -40,6 +46,8 @@ class Contact:
     phone_number: str
     name: Optional[str]
     jid: str
+    # Newer chats are stored under the contact's LID rather than their phone JID
+    lid_jid: Optional[str] = None
 
 @dataclass
 class MessageContext:
@@ -390,46 +398,124 @@ def list_chats(
             conn.close()
 
 
-def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+def _load_contact_directory() -> Tuple[List[dict], Dict[str, str]]:
+    """Read saved contact names from the bridge's whatsmeow store.
+
+    A person can have one row under their phone JID and another under their
+    LID; the LID-to-phone map merges those into a single entry.
+
+    Returns the merged people and the LID-to-phone map.
+    """
+    uri = Path(WHATSAPP_DB_PATH).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+        cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map")
+        lid_to_pn = dict(cursor.fetchall())
+        pn_to_lid = {pn: lid for lid, pn in lid_to_pn.items()}
+
+        # Name columns in order of preference
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
-        
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+            SELECT their_jid, full_name, first_name, business_name, push_name
+            FROM whatsmeow_contacts
+        """)
+
+        people = {}
+        for their_jid, *names in cursor.fetchall():
+            user, _, server = their_jid.partition('@')
+            if server == 's.whatsapp.net':
+                phone, lid = user, pn_to_lid.get(user)
+            elif server == 'lid':
+                phone, lid = lid_to_pn.get(user), user
+            else:
+                continue
+
+            person = people.setdefault(phone or f"{lid}@lid", {"phone": phone, "lid": lid, "names": []})
+            person["names"].extend((rank, name) for rank, name in enumerate(names) if name)
+
+        return list(people.values()), lid_to_pn
     finally:
-        if 'conn' in locals():
-            conn.close()
+        conn.close()
+
+
+def search_contacts(query: str) -> List[Contact]:
+    """Search contacts by name, phone number, or LID.
+
+    Saved contact names come from the whatsmeow store, so contacts whose chats
+    are keyed by LID (and so have no name in messages.db) are still found.
+    """
+    needle = query.lower()
+    # Keyed by phone number, or by LID JID when the phone number is unknown
+    results: Dict[str, Contact] = {}
+
+    try:
+        people, lid_to_pn = _load_contact_directory()
+    except sqlite3.Error as e:
+        print(f"Contact store error: {e}", file=sys.stderr)
+        people, lid_to_pn = [], {}
+    pn_to_lid = {pn: lid for lid, pn in lid_to_pn.items()}
+
+    for person in people:
+        phone, lid = person["phone"], person["lid"]
+        names = [name for _, name in sorted(person["names"])]
+        searchable = [name.lower() for name in names] + [phone or "", lid or ""]
+        if not any(needle in value for value in searchable):
+            continue
+
+        results[phone or f"{lid}@lid"] = Contact(
+            phone_number=phone or "",
+            name=names[0] if names else None,
+            jid=f"{phone}@s.whatsapp.net" if phone else f"{lid}@lid",
+            lid_jid=f"{lid}@lid" if lid else None
+        )
+
+    # Chats with no saved contact (e.g. unsaved numbers) can still match by chat name or JID
+    try:
+        with closing(sqlite3.connect(MESSAGES_DB_PATH)) as conn:
+            cursor = conn.cursor()
+
+            search_pattern = '%' + query + '%'
+
+            cursor.execute("""
+                SELECT DISTINCT
+                    jid,
+                    name
+                FROM chats
+                WHERE
+                    (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                    AND jid NOT LIKE '%@g.us'
+                ORDER BY name, jid
+                LIMIT 50
+            """, (search_pattern, search_pattern))
+            chat_rows = cursor.fetchall()
+    except sqlite3.Error as e:
+        print(f"Database error: {e}", file=sys.stderr)
+        chat_rows = []
+
+    for jid, name in chat_rows:
+        user, _, server = jid.partition('@')
+        if server == 'lid':
+            phone, lid = lid_to_pn.get(user), user
+        else:
+            phone, lid = user, pn_to_lid.get(user)
+
+        key = phone or jid
+        if key in results:
+            continue
+        results[key] = Contact(
+            phone_number=phone or "",
+            name=name,
+            jid=f"{phone}@s.whatsapp.net" if server == 'lid' and phone else jid,
+            lid_jid=f"{lid}@lid" if lid else None
+        )
+
+    # Names with a word starting with the query come first ("Xi" before "Maxine")
+    def sort_key(contact: Contact):
+        words = re.split(r'\W+', (contact.name or "").lower())
+        starts_with_query = any(word.startswith(needle) for word in words if word)
+        return (not starts_with_query, (contact.name or contact.jid).lower())
+
+    return sorted(results.values(), key=sort_key)[:50]
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
