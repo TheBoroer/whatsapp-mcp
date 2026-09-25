@@ -7,6 +7,7 @@ from typing import Optional, List, Tuple, Dict
 import os.path
 import re
 import sys
+import time
 import requests
 import json
 import audio
@@ -56,6 +57,10 @@ class MessageContext:
     after: List[Message]
 
 def get_sender_name(sender_jid: str) -> str:
+    saved_name = _contact_names().get(sender_jid.split('@')[0])
+    if saved_name:
+        return saved_name
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -104,7 +109,8 @@ def format_message(message: Message, show_chat_info: bool = True) -> str:
     output = ""
     
     if show_chat_info and message.chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
+        chat_label = _with_id(_chat_display_name(message.chat_jid, message.chat_name), message.chat_jid)
+        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {chat_label} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
 
@@ -113,7 +119,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> str:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
 
     try:
-        sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
+        sender_name = _with_id(get_sender_name(message.sender), message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
@@ -358,8 +364,19 @@ def list_chats(
         params = []
         
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+            # LID chats have no name in messages.db, so also match saved contact names
+            needle = query.lower()
+            contact_jids = [
+                f"{user}@{server}"
+                for user, name in _contact_names().items() if needle in name.lower()
+                for server in ('s.whatsapp.net', 'lid')
+            ]
+            clause = "LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?"
             params.extend([f"%{query}%", f"%{query}%"])
+            if contact_jids:
+                clause += f" OR chats.jid IN ({', '.join('?' * len(contact_jids))})"
+                params.extend(contact_jids)
+            where_clauses.append(f"({clause})")
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -380,7 +397,7 @@ def list_chats(
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=_chat_display_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -436,6 +453,56 @@ def _load_contact_directory() -> Tuple[List[dict], Dict[str, str]]:
         return list(people.values()), lid_to_pn
     finally:
         conn.close()
+
+
+# Contact names are re-read at most this often, so new contacts show up quickly
+_NAMES_TTL_SECONDS = 60
+_names_cache: Tuple[float, Dict[str, str]] = (float('-inf'), {})
+
+
+def _contact_names() -> Dict[str, str]:
+    """Best saved name for each phone number and LID (bare user part, no @server)."""
+    global _names_cache
+    loaded_at, names = _names_cache
+    if time.monotonic() - loaded_at < _NAMES_TTL_SECONDS:
+        return names
+
+    try:
+        people, _ = _load_contact_directory()
+    except sqlite3.Error as e:
+        print(f"Contact store error: {e}", file=sys.stderr)
+        people = []
+
+    names = {}
+    for person in people:
+        if not person["names"]:
+            continue
+        best_name = min(person["names"])[1]
+        for user in (person["phone"], person["lid"]):
+            if user:
+                names[user] = best_name
+
+    _names_cache = (time.monotonic(), names)
+    return names
+
+
+def _chat_display_name(jid: str, stored_name: Optional[str]) -> Optional[str]:
+    """Prefer the saved contact name when the stored chat name is just a number.
+
+    LID chats are often stored with a bare number as their name: their own ID,
+    or sometimes your own ID when the chat started with a message you sent.
+    """
+    user = jid.split('@')[0]
+    if jid.endswith('@g.us') or (stored_name and not stored_name.isdigit()):
+        return stored_name
+    return _contact_names().get(user) or user
+
+
+def _with_id(name: Optional[str], jid: str) -> str:
+    """A readable name that keeps the raw ID, e.g. "Xi [203169250451544@lid]"."""
+    if not name or name in (jid, jid.split('@')[0]):
+        return jid
+    return f"{name} [{jid}]"
 
 
 def search_contacts(query: str) -> List[Contact]:
@@ -551,7 +618,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=_chat_display_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
@@ -651,7 +718,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             
         return Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=_chat_display_name(chat_data[0], chat_data[1]),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
@@ -694,7 +761,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             
         return Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=_chat_display_name(chat_data[0], chat_data[1]),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
