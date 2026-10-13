@@ -470,6 +470,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+
+	maybeTrigger(client, messageStore, msg, name, content, logger)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
