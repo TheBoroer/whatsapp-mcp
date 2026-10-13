@@ -35,12 +35,13 @@ func TestTriggerPattern(t *testing.T) {
 func TestTriggerModelAndEffort(t *testing.T) {
 	t.Setenv("WA_TRIGGER_CMD", "claude -p")
 	got := strings.Join(loadTriggerConfig().cmd, " ")
-	if got != "claude -p --model claude-opus-5-5 --effort medium" {
+	if got != "claude -p --model claude-opus-5-5 --effort medium --disallowedTools "+triggerDenyTools {
 		t.Errorf("default cmd = %q", got)
 	}
 
 	t.Setenv("WA_TRIGGER_MODEL", "none")
 	t.Setenv("WA_TRIGGER_EFFORT", "low")
+	t.Setenv("WA_TRIGGER_DENY_TOOLS", "none")
 	got = strings.Join(loadTriggerConfig().cmd, " ")
 	if got != "claude -p --effort low" {
 		t.Errorf("override cmd = %q", got)

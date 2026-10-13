@@ -17,6 +17,8 @@ package main
 //                          Set to "inline" to paste the file into the prompt instead (any CLI).
 //   WA_TRIGGER_MODEL       passed as --model (default "claude-opus-5-5"; "none" to omit)
 //   WA_TRIGGER_EFFORT      passed as --effort (default "medium"; "none" to omit)
+//   WA_TRIGGER_DENY_TOOLS  passed as --disallowedTools (default: the WhatsApp MCP send
+//                          tools, since the bridge posts the reply itself; "none" to omit)
 //   WA_TRIGGER_WORKDIR     working directory for the CLI (default $HOME/.whatsapp-trigger)
 //   WA_TRIGGER_TIMEOUT     max run time, Go duration (default 5m)
 //   WA_TRIGGER_SESSIONS    set to 0 to turn off threads (see below) and read plain stdout
@@ -49,6 +51,9 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// triggerDenyTools are the WhatsApp MCP tools that send messages.
+const triggerDenyTools = "mcp__whatsapp__send_message,mcp__whatsapp__send_file,mcp__whatsapp__send_audio_message"
 
 const (
 	triggerReplyPrefix = "🤖 "
@@ -115,6 +120,12 @@ func loadTriggerConfig() *triggerConfig {
 	}
 	if e := envOr("WA_TRIGGER_EFFORT", "medium"); e != "none" {
 		cfg.cmd = append(cfg.cmd, "--effort", e)
+	}
+	// The bridge posts stdout as the reply. If Claude can reach the MCP send
+	// tools it tries to send on its own, the MCP server's approval check rejects
+	// it, and Claude then posts a "here's the draft" note to the chat instead.
+	if d := envOr("WA_TRIGGER_DENY_TOOLS", triggerDenyTools); d != "none" {
+		cfg.cmd = append(cfg.cmd, "--disallowedTools", d)
 	}
 
 	cfg.promptFlag = envOr("WA_TRIGGER_PROMPT_FLAG", "--append-system-prompt-file")
@@ -482,9 +493,9 @@ func triggerEnv() []string {
 
 func chatKind(msg *events.Message) string {
 	if msg.Info.IsGroup {
-		return "group (everyone in it sees the reply)"
+		return "group (your output is posted here as the reply, and everyone in the group reads it)"
 	}
-	return "direct"
+	return "direct (your output is posted here as the reply, and the other person reads it)"
 }
 
 func sanitizeTag(s string) string {
