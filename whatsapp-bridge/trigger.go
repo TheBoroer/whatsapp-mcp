@@ -13,8 +13,10 @@ package main
 //                          (default "claude -p")
 //   WA_TRIGGER_PROMPT_FILE system prompt file (default trigger-prompt.md next to the binary,
 //                          then the working directory). Re-read on every trigger.
-//   WA_TRIGGER_PROMPT_FLAG flag used to pass the prompt file (default "--append-system-prompt-file").
-//                          Set to "inline" to paste the file into the prompt instead (any CLI).
+//   WA_TRIGGER_PROMPT_FLAG flag used to pass the prompt file (default "--system-prompt-file", which
+//                          replaces Claude Code's terminal-oriented default prompt so replies read
+//                          like chat messages, not markdown). Set to "inline" to paste the file
+//                          into the prompt instead (any CLI).
 //   WA_TRIGGER_MODEL       passed as --model (default "claude-opus-5-5"; "none" to omit)
 //   WA_TRIGGER_EFFORT      passed as --effort (default "medium"; "none" to omit)
 //   WA_TRIGGER_DENY_TOOLS  passed as --disallowedTools (default: the WhatsApp MCP send
@@ -128,7 +130,7 @@ func loadTriggerConfig() *triggerConfig {
 		cfg.cmd = append(cfg.cmd, "--disallowedTools", d)
 	}
 
-	cfg.promptFlag = envOr("WA_TRIGGER_PROMPT_FLAG", "--append-system-prompt-file")
+	cfg.promptFlag = envOr("WA_TRIGGER_PROMPT_FLAG", "--system-prompt-file")
 	cfg.workdir = envOr("WA_TRIGGER_WORKDIR", filepath.Join(os.Getenv("HOME"), ".whatsapp-trigger"))
 
 	cfg.timeout = 5 * time.Minute
@@ -318,8 +320,10 @@ func parseCLIResult(out []byte) (reply, sessionID string, err error) {
 // one of the bot's own replies, so it's labelled as such instead of as untrusted.
 func buildTriggerPrompt(msg *events.Message, chatName, instruction string, continuing, ownReply bool) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Chat: %s\nChat JID: %s\nMessage ID: %s\nChat type: %s\n\n",
-		chatName, msg.Info.Chat.String(), msg.Info.ID, chatKind(msg))
+	// The replaced system prompt carries no date, so give the model one.
+	fmt.Fprintf(&b, "Chat: %s\nChat JID: %s\nMessage ID: %s\nChat type: %s\nSent: %s\n\n",
+		chatName, msg.Info.Chat.String(), msg.Info.ID, chatKind(msg),
+		msg.Info.Timestamp.Local().Format("Monday, January 2, 2006 3:04 PM MST"))
 
 	if instruction == "" {
 		instruction = "(no instruction given; respond to the quoted message if there is one)"
