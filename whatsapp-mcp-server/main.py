@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 from mcp import types
@@ -15,7 +16,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    backfill_chat_batch as whatsapp_backfill_chat_batch
 )
 
 # Initialize FastMCP server
@@ -326,6 +328,57 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+async def backfill_history(chat_jid: str, max_batches: int = 5) -> Dict[str, Any]:
+    """Pull older messages for one chat from the user's phone into the local database.
+
+    Each batch asks the phone for up to 50 messages older than the oldest one stored,
+    so repeated calls walk further back in time. Stops early when the phone has no
+    older history. The phone must be online. Only history still on the phone is available.
+
+    Args:
+        chat_jid: The JID of the chat to backfill
+        max_batches: Number of 50-message batches to request (default 5, max 20)
+
+    Returns:
+        A dictionary with the total messages added, the oldest stored timestamp before
+        and after, why it stopped, and the per-batch results
+    """
+    max_batches = max(1, min(max_batches, 20))
+    batches = []
+    stop_reason = "max_batches reached"
+
+    for i in range(max_batches):
+        if i > 0:
+            # Pace requests to the phone; this is an unofficial client.
+            await asyncio.sleep(3)
+        result = await asyncio.to_thread(whatsapp_backfill_chat_batch, chat_jid)
+        batches.append(result)
+        if not result.get("success"):
+            stop_reason = "error"
+            break
+        if result.get("exhausted"):
+            stop_reason = "no older history on the phone"
+            break
+        if result.get("timed_out"):
+            stop_reason = "phone did not respond (offline, or no older history)"
+            break
+
+    ok = [b for b in batches if b.get("success")]
+    if not ok:
+        return {"success": False, "chat_jid": chat_jid, "message": batches[0].get("message"), "batches": batches}
+    first, last = ok[0], ok[-1]
+    added = (last.get("stored_after") or 0) - (first.get("stored_before") or 0)
+    return {
+        "success": len(ok) == len(batches),
+        "chat_jid": chat_jid,
+        "messages_added": max(added, 0),
+        "oldest_before": first.get("oldest_before"),
+        "oldest_after": last.get("oldest_after"),
+        "stop_reason": stop_reason,
+        "batches": batches,
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server

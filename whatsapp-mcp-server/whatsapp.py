@@ -922,3 +922,24 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def backfill_chat_batch(chat_jid: str, count: int = 50) -> Dict:
+    """Ask the phone for one batch of messages older than the oldest stored one.
+
+    Blocks until the bridge has stored the phone's response or gives up
+    (the bridge waits up to 30s), so the HTTP timeout is longer than that.
+
+    Returns the bridge's JSON response (success, message, stored_before,
+    stored_after, oldest_before, oldest_after, timed_out, exhausted).
+    """
+    url = f"{WHATSAPP_API_BASE_URL}/backfill"
+    try:
+        response = requests.post(url, json={"chat_jid": chat_jid, "count": count}, timeout=45)
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {e}"}
+
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        return {"success": False, "message": f"HTTP {response.status_code}: {response.text.strip()}"}

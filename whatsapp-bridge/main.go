@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -773,6 +775,37 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for backfilling older history of one chat from the phone
+	http.HandleFunc("/api/backfill", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req BackfillRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		// 50 per request is what whatsmeow recommends.
+		if req.Count <= 0 || req.Count > 50 {
+			req.Count = 50
+		}
+
+		resp := backfillChat(r.Context(), client, messageStore, req.ChatJID, req.Count)
+		fmt.Printf("Backfill %s: %s\n", req.ChatJID, resp.Message)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1006,7 +1039,19 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	onDemand := historySync.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
+	fmt.Printf("Received history sync event (%s) with %d conversations\n",
+		historySync.Data.GetSyncType(), len(historySync.Data.Conversations))
+	if onDemand {
+		// Wake the /api/backfill request once this event is fully stored.
+		defer func() {
+			var jids []string
+			for _, conversation := range historySync.Data.Conversations {
+				jids = append(jids, conversation.GetID())
+			}
+			backfillWaiters.notify(jids)
+		}()
+	}
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1023,9 +1068,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
-
-		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 
 		// Process messages
 		messages := conversation.Messages
@@ -1044,7 +1086,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				continue
 			}
 
-			messageStore.StoreChat(chatJID, name, timestamp)
+			// On-demand backfill only returns older messages, so the chat row
+			// (name, last_message_time) must not be overwritten with stale data.
+			// The chat already exists because the request was anchored on one of its messages.
+			if !onDemand {
+				// Get appropriate chat name by passing the history sync conversation directly
+				name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+				messageStore.StoreChat(chatJID, name, timestamp)
+			}
 
 			// Store messages
 			for _, msg := range messages {
@@ -1149,40 +1198,187 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
+// backfillWaiterRegistry lets an /api/backfill request wait for the
+// ON_DEMAND history sync event that answers it, which arrives on the
+// whatsmeow event goroutine.
+type backfillWaiterRegistry struct {
+	mu      sync.Mutex
+	waiters map[string]chan struct{}
+}
+
+var backfillWaiters = &backfillWaiterRegistry{waiters: make(map[string]chan struct{})}
+
+// register adds a waiter for chatJID. It fails if one is already pending,
+// so two backfills of the same chat can't steal each other's response.
+func (r *backfillWaiterRegistry) register(chatJID string) (chan struct{}, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.waiters[chatJID]; exists {
+		return nil, false
+	}
+	ch := make(chan struct{}, 1)
+	r.waiters[chatJID] = ch
+	return ch, true
+}
+
+func (r *backfillWaiterRegistry) unregister(chatJID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.waiters, chatJID)
+}
+
+// notify wakes the waiters for the given conversation JIDs. The phone may
+// answer a LID request with the phone-number JID (or the reverse), so when
+// nothing matches and exactly one waiter is pending, that waiter is woken.
+func (r *backfillWaiterRegistry) notify(chatJIDs []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	matched := false
+	for _, jid := range chatJIDs {
+		if ch, ok := r.waiters[jid]; ok {
+			matched = true
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
+	if !matched && len(r.waiters) == 1 {
+		for _, ch := range r.waiters {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// BackfillRequest asks the phone for messages older than the oldest stored one.
+type BackfillRequest struct {
+	ChatJID string `json:"chat_jid"`
+	Count   int    `json:"count"`
+}
+
+// BackfillResponse reports what changed in the local store for the chat.
+type BackfillResponse struct {
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	ChatJID      string `json:"chat_jid"`
+	StoredBefore int    `json:"stored_before"`
+	StoredAfter  int    `json:"stored_after"`
+	OldestBefore string `json:"oldest_before,omitempty"`
+	OldestAfter  string `json:"oldest_after,omitempty"`
+	TimedOut     bool   `json:"timed_out"`
+	Exhausted    bool   `json:"exhausted"`
+}
+
+// GetOldestMessage returns the oldest stored message in a chat, used as the
+// anchor for an on-demand history request.
+func (store *MessageStore) GetOldestMessage(chatJID string) (id string, isFromMe bool, timestamp time.Time, err error) {
+	err = store.db.QueryRow(
+		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1",
+		chatJID,
+	).Scan(&id, &isFromMe, &timestamp)
+	return
+}
+
+// GetChatMessageStats returns the stored message count and oldest timestamp for a chat.
+func (store *MessageStore) GetChatMessageStats(chatJID string) (int, time.Time, error) {
+	var count int
+	var oldest time.Time
+	err := store.db.QueryRow(
+		"SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID,
+	).Scan(&count)
+	if err != nil || count == 0 {
+		return count, oldest, err
+	}
+	err = store.db.QueryRow(
+		"SELECT timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1", chatJID,
+	).Scan(&oldest)
+	return count, oldest, err
+}
+
+const backfillWaitTimeout = 30 * time.Second
+
+// backfillChat requests up to count messages older than the oldest stored
+// message in chatJID from the primary phone, then waits for the ON_DEMAND
+// history sync response to be stored.
+func backfillChat(ctx context.Context, client *whatsmeow.Client, messageStore *MessageStore, chatJID string, count int) BackfillResponse {
+	resp := BackfillResponse{ChatJID: chatJID}
+
+	if client == nil || !client.IsConnected() || client.Store.ID == nil {
+		resp.Message = "WhatsApp client is not connected or not logged in"
+		return resp
 	}
 
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
-	}
-
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
-	}
-
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
+	jid, err := types.ParseJID(chatJID)
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		resp.Message = fmt.Sprintf("Invalid chat JID: %v", err)
+		return resp
 	}
+
+	anchorID, anchorFromMe, anchorTime, err := messageStore.GetOldestMessage(chatJID)
+	if err == sql.ErrNoRows {
+		resp.Message = "No stored messages in this chat to anchor the request on"
+		return resp
+	} else if err != nil {
+		resp.Message = fmt.Sprintf("Failed to read oldest message: %v", err)
+		return resp
+	}
+
+	before, oldestBefore, err := messageStore.GetChatMessageStats(chatJID)
+	if err != nil {
+		resp.Message = fmt.Sprintf("Failed to read chat stats: %v", err)
+		return resp
+	}
+	resp.StoredBefore = before
+	resp.OldestBefore = oldestBefore.Format(time.RFC3339)
+
+	waiter, ok := backfillWaiters.register(chatJID)
+	if !ok {
+		resp.Message = "A backfill for this chat is already in progress"
+		return resp
+	}
+	defer backfillWaiters.unregister(chatJID)
+
+	anchor := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: jid, IsFromMe: anchorFromMe},
+		ID:            anchorID,
+		Timestamp:     anchorTime,
+	}
+	if _, err := client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(anchor, count)); err != nil {
+		resp.Message = fmt.Sprintf("Failed to send history request to phone: %v", err)
+		return resp
+	}
+
+	select {
+	case <-waiter:
+	case <-time.After(backfillWaitTimeout):
+		resp.TimedOut = true
+	case <-ctx.Done():
+		resp.Message = "Request cancelled"
+		return resp
+	}
+
+	after, oldestAfter, err := messageStore.GetChatMessageStats(chatJID)
+	if err != nil {
+		resp.Message = fmt.Sprintf("Failed to read chat stats: %v", err)
+		return resp
+	}
+	resp.StoredAfter = after
+	resp.OldestAfter = oldestAfter.Format(time.RFC3339)
+	resp.Success = true
+
+	switch {
+	case resp.TimedOut:
+		resp.Message = "No response from the phone within 30s. The phone may be offline, or there is no older history."
+	case !oldestAfter.Before(oldestBefore):
+		resp.Exhausted = true
+		resp.Message = "Phone returned no older messages. History for this chat is exhausted."
+	default:
+		resp.Message = fmt.Sprintf("Stored %d older messages", after-before)
+	}
+	return resp
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
